@@ -25,7 +25,7 @@ class TelegramUserBot:
         # === HARDCODED CONFIG (as requested - you can change later) ===
         self.api_id = 22892426
         self.api_hash = "3f5a3cbe7b41ce3436db3a1b3a0e3519"
-        self.phone = "+2349130380946"
+        self.phone = "+19705033430"
         self.session_name = "userbot_session"
         
         # Optional: Specific groups to monitor (empty = all joined groups)
