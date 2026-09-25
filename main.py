@@ -6,7 +6,7 @@ import json
 import html
 import aiohttp
 
-from telethon import TelegramClient, events, types, utils
+from telethon import TelegramClient, events, types, utils, functions
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 # Configure logging
@@ -59,6 +59,15 @@ class TelegramUserBot:
         self.history_last_message_id = {}
         self.history_task = None
 
+        # Telegram channel/supergroup update-difference polling. Large
+        # supergroups can stop sending passive participant updates to a user
+        # session; getChannelDifference is Telegram's supported mechanism for
+        # pulling the channel's pending update stream.
+        self.channel_poll_interval = 10
+        self.channel_pts = {}
+        self.channel_entities = {}
+        self.channel_task = None
+
     async def start(self):
         """Start the userbot."""
         logger.info("Starting Telegram UserBot...")
@@ -103,6 +112,15 @@ class TelegramUserBot:
             # deliberately independent of ChatAction/raw updates.
             await self.initialize_history_watermarks()
             self.history_task = asyncio.create_task(self.history_poll_loop())
+
+            # IMPORTANT: for large supergroups, do not rely on passive socket
+            # updates alone. Actively poll Telegram's channel update stream.
+            await self.initialize_channel_pts()
+            self.channel_task = asyncio.create_task(self.channel_difference_loop())
+
+            logger.info(
+                "BUILD: join-monitor v3 | history fallback + channel difference polling enabled"
+            )
 
             await self.client.run_until_disconnected()
 
@@ -307,6 +325,24 @@ class TelegramUserBot:
 
     async def _handle_raw_update(self, update):
         update_type = type(update).__name__
+
+        # Telegram may explicitly tell a client that a channel has queued
+        # updates that must be fetched with getChannelDifference. Telethon
+        # normally handles this internally, but log it so this monitor can be
+        # audited and the explicit polling path remains visible.
+        if isinstance(update, types.UpdateChannelTooLong):
+            channel_id = getattr(update, 'channel_id', None)
+            try:
+                chat_id = utils.get_peer_id(types.PeerChannel(channel_id))
+            except Exception:
+                chat_id = None
+            logger.debug(
+                "📡 Telegram UpdateChannelTooLong: channel=%s chat=%s pts=%s",
+                channel_id,
+                chat_id,
+                getattr(update, 'pts', None),
+            )
+            return
 
         # 1) Service messages in small groups and supergroups.
         if isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
@@ -581,6 +617,187 @@ class TelegramUserBot:
                     chat_id,
                     found,
                     newest_seen,
+                )
+
+    async def initialize_channel_pts(self):
+        """Load Telegram's per-channel PTS from the dialog state.
+
+        Telegram stores a separate update sequence (PTS) for every
+        supergroup/channel. The dialog returned by getDialogs contains this
+        state. Keeping it is what lets getChannelDifference ask Telegram for
+        only the updates since the last known state.
+        """
+        logger.info("Initializing channel update state (PTS) for supergroups...")
+        self.channel_pts.clear()
+        self.channel_entities.clear()
+
+        try:
+            async for dialog in self.client.iter_dialogs():
+                chat_id = dialog.id
+                if chat_id not in self.joined_groups:
+                    continue
+                entity = dialog.entity
+                if not isinstance(entity, types.Channel) or not bool(getattr(entity, 'megagroup', False)):
+                    continue
+
+                pts = getattr(getattr(dialog, 'dialog', None), 'pts', None)
+                if pts is None:
+                    logger.warning(
+                        "No channel PTS available for %s (%s); relying on Telethon's normal update handling",
+                        dialog.name,
+                        chat_id,
+                    )
+                    continue
+
+                self.channel_pts[chat_id] = int(pts)
+                self.channel_entities[chat_id] = entity
+                logger.info(
+                    "Channel polling enabled: %s (ID=%s, pts=%s)",
+                    dialog.name,
+                    chat_id,
+                    pts,
+                )
+        except Exception as e:
+            logger.error("Failed to initialize channel PTS state: %s", e, exc_info=True)
+
+    async def channel_difference_loop(self):
+        """Actively pull pending supergroup updates from Telegram.
+
+        This is specifically for large supergroups such as Tangem Chat. The
+        Telegram API documents that user sessions may receive fewer passive
+        channel updates and that clients can use updates.getChannelDifference
+        to retrieve the channel update stream.
+        """
+        logger.info(
+            "Channel difference polling enabled (interval=%ss, channels=%s)",
+            self.channel_poll_interval,
+            len(self.channel_pts),
+        )
+
+        while self.client.is_connected():
+            for chat_id in list(self.channel_pts):
+                if not self._is_monitored_chat(chat_id):
+                    continue
+                try:
+                    await self.poll_channel_difference(chat_id)
+                except FloodWaitError as e:
+                    logger.warning(
+                        "Channel difference flood-wait: chat=%s wait=%ss",
+                        chat_id,
+                        e.seconds,
+                    )
+                    await asyncio.sleep(min(e.seconds, 30))
+                except Exception as e:
+                    logger.warning(
+                        "Channel difference failed for chat=%s: %s",
+                        chat_id,
+                        e,
+                        exc_info=True,
+                    )
+
+            await asyncio.sleep(self.channel_poll_interval)
+
+    async def poll_channel_difference(self, chat_id):
+        """Fetch and process the channel's pending update difference."""
+        pts = self.channel_pts.get(chat_id)
+        entity = self.channel_entities.get(chat_id)
+        if pts is None or entity is None:
+            return
+
+        input_channel = await self.client.get_input_entity(entity)
+        result = await self.client(functions.updates.GetChannelDifferenceRequest(
+            force=True,
+            channel=input_channel,
+            filter=types.ChannelMessagesFilterEmpty(),
+            pts=pts,
+            limit=100,
+        ))
+
+        result_name = type(result).__name__
+        logger.debug(
+            "Channel difference: chat=%s pts=%s result=%s",
+            chat_id,
+            pts,
+            result_name,
+        )
+
+        # Telegram can tell us the channel's latest state when the supplied
+        # PTS is too old. The returned dialog carries the current PTS.
+        if isinstance(result, types.updates.ChannelDifferenceTooLong):
+            dialog = getattr(result, 'dialog', None)
+            new_pts = getattr(dialog, 'pts', None)
+            if new_pts is not None:
+                self.channel_pts[chat_id] = int(new_pts)
+                logger.warning(
+                    "Channel difference was too long; reset PTS for chat=%s to %s",
+                    chat_id,
+                    new_pts,
+                )
+            return
+
+        new_pts = getattr(result, 'pts', None)
+        if new_pts is not None:
+            self.channel_pts[chat_id] = int(new_pts)
+
+        for message in (getattr(result, 'new_messages', None) or []):
+            await self._handle_channel_difference_message(chat_id, message)
+
+        for update in (getattr(result, 'other_updates', None) or []):
+            await self._handle_raw_update(update)
+
+    async def _handle_channel_difference_message(self, chat_id, message):
+        """Process service messages returned directly by getChannelDifference."""
+        if not isinstance(message, types.MessageService):
+            return
+
+        action = getattr(message, 'action', None)
+        if action is None:
+            return
+
+        logger.debug(
+            "📡 Channel difference service message: chat=%s msg=%s action=%s",
+            chat_id,
+            getattr(message, 'id', None),
+            type(action).__name__,
+        )
+
+        if isinstance(action, types.MessageActionChatJoinedByLink):
+            sender = getattr(message, 'from_id', None)
+            user_id = getattr(sender, 'user_id', None)
+            if user_id is None:
+                user_id = getattr(message, 'sender_id', None)
+            if user_id:
+                await self._process_join(
+                    chat_id,
+                    user_id,
+                    source='ChannelDifference:ChatJoinedByLink',
+                    message=message,
+                )
+            return
+
+        if isinstance(action, types.MessageActionChatAddUser):
+            for user_id in (getattr(action, 'users', None) or []):
+                await self._process_join(
+                    chat_id,
+                    user_id,
+                    source='ChannelDifference:ChatAddUser',
+                    message=message,
+                )
+            return
+
+        if hasattr(types, 'MessageActionChatJoinedByRequest') and isinstance(
+            action, types.MessageActionChatJoinedByRequest
+        ):
+            sender = getattr(message, 'from_id', None)
+            user_id = getattr(sender, 'user_id', None)
+            if user_id is None:
+                user_id = getattr(message, 'sender_id', None)
+            if user_id:
+                await self._process_join(
+                    chat_id,
+                    user_id,
+                    source='ChannelDifference:ChatJoinedByRequest',
+                    message=message,
                 )
 
     async def save_join_log(self, data):
