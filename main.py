@@ -33,8 +33,8 @@ class TelegramUserBot:
         self.target_groups = [int(gid.strip()) for gid in target_ids.split(',') if gid.strip()]
         
         # Notification bot
-        self.notify_bot_token = "8883709162:AAH4hi8NPjE3ULxGdd3gcXFCjEwDGnosFbM"
-        self.notify_chat_id = "8614416084"
+        self.notify_bot_token = "8857382932:AAFI0XH6RZzeT3WsDvi2Q6l0d_dNpOF28p8"
+        self.notify_chat_id = "-1004499759470"
         
         # Temporary code for login
         self.verification_code = None
