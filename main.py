@@ -63,7 +63,7 @@ class TelegramUserBot:
         # supergroups can stop sending passive participant updates to a user
         # session; getChannelDifference is Telegram's supported mechanism for
         # pulling the channel's pending update stream.
-        self.channel_poll_interval = 10
+        self.channel_poll_interval = 5
         self.channel_pts = {}
         self.channel_entities = {}
         self.channel_task = None
@@ -116,6 +116,7 @@ class TelegramUserBot:
             # IMPORTANT: for large supergroups, do not rely on passive socket
             # updates alone. Actively poll Telegram's channel update stream.
             await self.initialize_channel_pts()
+            await self.inspect_channel_capabilities()
             self.channel_task = asyncio.create_task(self.channel_difference_loop())
 
             logger.info(
@@ -660,6 +661,38 @@ class TelegramUserBot:
         except Exception as e:
             logger.error("Failed to initialize channel PTS state: %s", e, exc_info=True)
 
+    async def inspect_channel_capabilities(self):
+        """Inspect what Telegram exposes to this account for each supergroup.
+
+        This does not attempt to bypass permissions. It records the server-side
+        visibility flags so the log clearly distinguishes a monitoring problem
+        from a participant-visibility restriction.
+        """
+        logger.info("Inspecting Telegram participant visibility for monitored supergroups...")
+        for chat_id, entity in list(self.channel_entities.items()):
+            try:
+                full = await self.client(functions.channels.GetFullChannelRequest(
+                    channel=await self.client.get_input_entity(entity)
+                ))
+                full_chat = getattr(full, 'full_chat', None)
+                can_view = bool(getattr(full_chat, 'can_view_participants', False))
+                hidden = bool(getattr(full_chat, 'participants_hidden', False))
+                count = getattr(full_chat, 'participants_count', None)
+                logger.info(
+                    "Channel capability: chat=%s name=%s can_view_participants=%s participants_hidden=%s participants_count=%s",
+                    chat_id,
+                    getattr(entity, 'title', None) or chat_id,
+                    can_view,
+                    hidden,
+                    count,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Channel capability check failed: chat=%s error=%s",
+                    chat_id,
+                    e,
+                )
+
     async def channel_difference_loop(self):
         """Actively pull pending supergroup updates from Telegram.
 
@@ -706,7 +739,11 @@ class TelegramUserBot:
 
         input_channel = await self.client.get_input_entity(entity)
         result = await self.client(functions.updates.GetChannelDifferenceRequest(
-            force=True,
+            # Do NOT use force=True here. Telegram documents force=True as a
+            # way to skip updates that may be considered unnecessary. For a
+            # membership monitor we want the complete update stream, including
+            # participant transitions.
+            force=False,
             channel=input_channel,
             filter=types.ChannelMessagesFilterEmpty(),
             pts=pts,
