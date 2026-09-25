@@ -51,6 +51,14 @@ class TelegramUserBot:
         self.processed_joins = {}
         self.processed_ttl_seconds = 120
 
+        # History polling is a fallback for supergroups where Telegram does not
+        # deliver a live ChatAction/UpdateChannelParticipant to this account.
+        # We track the last message ID per group so we only inspect messages
+        # that appeared since the previous scan.
+        self.history_poll_interval = 5
+        self.history_last_message_id = {}
+        self.history_task = None
+
     async def start(self):
         """Start the userbot."""
         logger.info("Starting Telegram UserBot...")
@@ -90,6 +98,11 @@ class TelegramUserBot:
                 "UserBot is now running. Monitoring %d groups/supergroups...",
                 len(self.joined_groups),
             )
+
+            # Start the history fallback after the initial dialog scan. This is
+            # deliberately independent of ChatAction/raw updates.
+            await self.initialize_history_watermarks()
+            self.history_task = asyncio.create_task(self.history_poll_loop())
 
             await self.client.run_until_disconnected()
 
@@ -415,6 +428,160 @@ class TelegramUserBot:
             return True
 
         return False
+
+    async def initialize_history_watermarks(self):
+        """Remember the newest message currently visible in each monitored group.
+
+        This prevents old join service messages from being replayed as new joins
+        when the process starts. Future messages are then scanned incrementally.
+        """
+        logger.info("Initializing message-history watermarks...")
+        for chat_id in list(self.joined_groups):
+            try:
+                if self.target_groups and chat_id not in self.target_groups:
+                    continue
+                entity = await self.client.get_entity(chat_id)
+                latest = await self.client.get_messages(entity, limit=1)
+                self.history_last_message_id[chat_id] = latest[0].id if latest else 0
+                logger.debug(
+                    "History watermark: chat=%s last_message_id=%s",
+                    chat_id,
+                    self.history_last_message_id[chat_id],
+                )
+            except Exception as e:
+                logger.warning(
+                    "Could not initialize history watermark for chat %s: %s",
+                    chat_id,
+                    e,
+                )
+
+    async def history_poll_loop(self):
+        """Continuously inspect new service messages as a second detection path.
+
+        Some large/modern supergroups do not produce a usable ChatAction for a
+        normal member account. Telegram still defines join service-message
+        actions, including joins by invite link and joins approved by an admin.
+        Polling the message history gives us a second way to catch those joins.
+        """
+        logger.info(
+            "History fallback enabled (interval=%ss)",
+            self.history_poll_interval,
+        )
+
+        while self.client.is_connected():
+            try:
+                for chat_id in list(self.joined_groups):
+                    if self.target_groups and chat_id not in self.target_groups:
+                        continue
+                    try:
+                        await self.scan_new_group_messages(chat_id)
+                    except FloodWaitError as e:
+                        logger.warning(
+                            "History scan flood-wait for chat %s: %ss",
+                            chat_id,
+                            e.seconds,
+                        )
+                        await asyncio.sleep(min(e.seconds, 30))
+                    except Exception as e:
+                        logger.warning(
+                            "History scan failed for chat %s: %s",
+                            chat_id,
+                            e,
+                            exc_info=True,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("History polling loop error: %s", e, exc_info=True)
+
+            await asyncio.sleep(self.history_poll_interval)
+
+    async def scan_new_group_messages(self, chat_id):
+        """Fetch messages newer than the last watermark and inspect service actions."""
+        entity = await self.client.get_entity(chat_id)
+        last_id = self.history_last_message_id.get(chat_id, 0)
+        newest_seen = last_id
+        found = 0
+
+        # iter_messages handles pagination, so a burst of >100 messages cannot
+        # silently advance the watermark past unseen service messages.
+        async for message in self.client.iter_messages(
+            entity,
+            min_id=last_id,
+            reverse=True,
+        ):
+            msg_id = getattr(message, 'id', None)
+            if msg_id is None:
+                continue
+            newest_seen = max(newest_seen, msg_id)
+            found += 1
+
+            if not isinstance(message, types.MessageService):
+                continue
+
+            action = getattr(message, 'action', None)
+            if action is None:
+                continue
+
+            action_name = type(action).__name__
+            logger.debug(
+                "📜 History service message: chat=%s msg=%s action=%s",
+                chat_id,
+                msg_id,
+                action_name,
+            )
+
+            if isinstance(action, types.MessageActionChatJoinedByLink):
+                # In a join-by-link service message, from_id is the joining user.
+                sender = getattr(message, 'from_id', None)
+                user_id = getattr(sender, 'user_id', None)
+                if user_id is None:
+                    user_id = getattr(message, 'sender_id', None)
+
+                if user_id:
+                    await self._process_join(
+                        chat_id,
+                        user_id,
+                        source='History:ChatJoinedByLink',
+                        message=message,
+                    )
+
+            elif isinstance(action, types.MessageActionChatAddUser):
+                for user_id in (getattr(action, 'users', None) or []):
+                    await self._process_join(
+                        chat_id,
+                        user_id,
+                        source='History:ChatAddUser',
+                        message=message,
+                    )
+
+            elif hasattr(types, 'MessageActionChatJoinedByRequest') and isinstance(
+                action, types.MessageActionChatJoinedByRequest
+            ):
+                # This action has no user_id field; the sender of the service
+                # message is the user who was accepted into the group.
+                sender = getattr(message, 'from_id', None)
+                user_id = getattr(sender, 'user_id', None)
+                if user_id is None:
+                    user_id = getattr(message, 'sender_id', None)
+
+                if user_id:
+                    await self._process_join(
+                        chat_id,
+                        user_id,
+                        source='History:ChatJoinedByRequest',
+                        message=message,
+                    )
+
+        if newest_seen > last_id:
+            self.history_last_message_id[chat_id] = newest_seen
+            if found:
+                logger.debug(
+                    "History scan advanced: chat=%s %s new messages, watermark=%s",
+                    chat_id,
+                    found,
+                    newest_seen,
+                )
 
     async def save_join_log(self, data):
         """Save join data to a JSON-lines log."""
